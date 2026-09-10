@@ -11,6 +11,9 @@ interface MessageBubbleProps {
 export default function MessageBubble({ message }: MessageBubbleProps) {
   const isUser = message.role === 'user'
   const hasContent = message.content.trim().length > 0
+  // When structured findings are present, `content` is the raw JSON that produced
+  // the cards, so render the cards only instead of duplicating the raw output.
+  const showProse = hasContent && !message.structured
 
   return (
     <div className={cn('flex w-full gap-3', isUser ? 'flex-row-reverse' : 'flex-row')}>
@@ -31,7 +34,20 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
           isUser ? 'items-end' : 'items-start',
         )}
       >
-        {hasContent && (
+        {isUser && message.images && message.images.length > 0 && (
+          <div className="flex flex-wrap justify-end gap-2">
+            {message.images.map((image) => (
+              <img
+                key={image.id}
+                src={image.previewUrl}
+                alt={image.name}
+                className="size-24 rounded-xl border border-neutral-200 object-cover shadow-sm"
+              />
+            ))}
+          </div>
+        )}
+
+        {showProse && (
           <div
             className={cn(
               'rounded-2xl px-4 py-2.5 text-sm shadow-sm',

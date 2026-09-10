@@ -16,11 +16,20 @@ export interface ClinicalFindings {
   urgency?: Urgency
 }
 
+/** Lightweight reference to an image attached to a message (in-memory only). */
+export interface ChatImage {
+  id: string
+  name: string
+  previewUrl: string
+}
+
 export interface Message {
   id: string
   role: Role
   content: string
   structured?: ClinicalFindings
+  /** Images attached to a user message, retained for display in the transcript. */
+  images?: ChatImage[]
 }
 
 export interface ChatSession {

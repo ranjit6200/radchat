@@ -14,9 +14,13 @@ interface PendingImage {
 
 interface ChatInputProps {
   onSend: (text: string, images: File[]) => void
+  /** Blocks sending while the model is loading or generating. */
+  disabled?: boolean
+  /** Progress line shown while `disabled` is true. */
+  statusMessage?: string
 }
 
-export default function ChatInput({ onSend }: ChatInputProps) {
+export default function ChatInput({ onSend, disabled = false, statusMessage }: ChatInputProps) {
   const [text, setText] = useState('')
   const [images, setImages] = useState<PendingImage[]>([])
   const [isDragging, setIsDragging] = useState(false)
@@ -73,7 +77,7 @@ export default function ChatInput({ onSend }: ChatInputProps) {
 
   const handleSend = () => {
     const trimmed = text.trim()
-    if (!trimmed) return
+    if (!trimmed || disabled) return
     onSend(trimmed, images.map((img) => img.file))
     setText('')
     clearImages()
@@ -135,7 +139,7 @@ export default function ChatInput({ onSend }: ChatInputProps) {
     addImages(Array.from(event.dataTransfer.files))
   }
 
-  const canSend = text.trim().length > 0
+  const canSend = text.trim().length > 0 && !disabled
 
   return (
     <div className="border-t border-neutral-200 bg-white p-3">
@@ -189,7 +193,7 @@ export default function ChatInput({ onSend }: ChatInputProps) {
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              disabled={images.length >= MAX_IMAGES}
+              disabled={disabled || images.length >= MAX_IMAGES}
               aria-label="Attach images"
               title="Attach images"
               className="flex size-9 shrink-0 items-center justify-center rounded-lg text-neutral-500 transition-colors hover:bg-neutral-100 hover:text-neutral-700 disabled:cursor-not-allowed disabled:opacity-40"
@@ -232,7 +236,9 @@ export default function ChatInput({ onSend }: ChatInputProps) {
         </div>
 
         <p className="mt-2 text-center text-xs text-neutral-400">
-          Drag & drop, paste, or use the image button - up to {MAX_IMAGES} images.
+          {disabled && statusMessage
+            ? statusMessage
+            : `Drag & drop, paste, or use the image button - up to ${MAX_IMAGES} images.`}
         </p>
       </div>
     </div>
