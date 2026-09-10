@@ -1,11 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useState } from 'react'
+import { AlertCircle } from 'lucide-react'
 import Sidebar from './components/Sidebar'
 import ChatWindow from './components/ChatWindow'
 import ChatInput from './components/ChatInput'
-import ModelControls from './components/ModelControls'
-import { useMedGemma } from './hooks/useMedGemma'
-import { preprocessToCanvas } from './utils/imageProcessor'
-import { buildPrompt } from './utils/promptBuilder'
+import ApiSettings from './components/ApiSettings'
+import { useChatModel } from './hooks/useChatModel'
+import {
+  getApiConfig,
+  isApiConfigured,
+  saveApiConfig,
+  type ApiConfig,
+} from './services/llmClient'
+import { fileToDataUrl } from './utils/fileToDataUrl'
+import { buildMessages } from './utils/promptBuilder'
 import { parseClinicalFindings } from './utils/clinicalParser'
 import type { ChatImage, ChatSession, ClinicalFindings, Message } from './types'
 
@@ -29,65 +36,51 @@ function createChat(): ChatSession {
 
 export default function App() {
   const [state, setState] = useState<ChatState>({ chats: [], activeChatId: null })
-  const {
-    isReady,
-    isInitializing,
-    isGenerating,
-    error,
-    statusMessage,
-    initEngine,
-    generateAnalysis,
-  } = useMedGemma()
-  const objectUrlsRef = useRef<Set<string>>(new Set())
+  const [apiConfig, setApiConfig] = useState<ApiConfig>(() => getApiConfig())
+  const { isGenerating, error, generate } = useChatModel()
 
-  // Release any object URLs created for message previews when the app unmounts.
-  useEffect(() => {
-    const urls = objectUrlsRef.current
-    return () => {
-      urls.forEach((url) => URL.revokeObjectURL(url))
-      urls.clear()
-    }
+  const isConfigured = isApiConfigured(apiConfig)
+
+  const handleConfigChange = useCallback((next: ApiConfig) => {
+    saveApiConfig(next)
+    setApiConfig(next)
   }, [])
 
   const createNewChat = useCallback(() => {
     const chat = createChat()
-    setState((prev) => ({
-      chats: [chat, ...prev.chats],
-      activeChatId: chat.id,
-    }))
+    setState((prev) => ({ chats: [chat, ...prev.chats], activeChatId: chat.id }))
   }, [])
 
   const selectChat = useCallback((id: string) => {
     setState((prev) => ({ ...prev, activeChatId: id }))
   }, [])
 
-  const deleteChat = useCallback(
-    (id: string) => {
-      // Revoke the deleted chat's image previews before dropping the state.
-      const target = state.chats.find((chat) => chat.id === id)
-      target?.messages.forEach((message) =>
-        message.images?.forEach((image) => {
-          URL.revokeObjectURL(image.previewUrl)
-          objectUrlsRef.current.delete(image.previewUrl)
-        }),
-      )
+  const deleteChat = useCallback((id: string) => {
+    setState((prev) => {
+      const chats = prev.chats.filter((chat) => chat.id !== id)
+      let activeChatId = prev.activeChatId
 
-      setState((prev) => {
-        const chats = prev.chats.filter((chat) => chat.id !== id)
-        let activeChatId = prev.activeChatId
+      // If the active chat was deleted, activate the most recently updated
+      // remaining chat (or none if the list is now empty).
+      if (activeChatId === id) {
+        const next = [...chats].sort((a, b) => b.updatedAt - a.updatedAt)[0]
+        activeChatId = next ? next.id : null
+      }
 
-        // If the active chat was deleted, activate the most recently updated
-        // remaining chat (or none if the list is now empty).
-        if (activeChatId === id) {
-          const next = [...chats].sort((a, b) => b.updatedAt - a.updatedAt)[0]
-          activeChatId = next ? next.id : null
-        }
+      return { chats, activeChatId }
+    })
+  }, [])
 
-        return { chats, activeChatId }
-      })
-    },
-    [state.chats],
-  )
+  const appendToChat = useCallback((chatId: string, message: Message) => {
+    setState((prev) => ({
+      ...prev,
+      chats: prev.chats.map((chat) =>
+        chat.id === chatId
+          ? { ...chat, updatedAt: Date.now(), messages: [...chat.messages, message] }
+          : chat,
+      ),
+    }))
+  }, [])
 
   const sendMessage = useCallback(
     async (text: string, images: File[]) => {
@@ -97,73 +90,58 @@ export default function App() {
       const chatId = state.activeChatId
       if (!chatId) return
 
-      // The model must be downloaded/loaded via the controls before analysis runs.
-      if (!isReady) return
+      const chat = state.chats.find((candidate) => candidate.id === chatId)
+      if (!chat) return
 
-      const chatImages: ChatImage[] = images.map((file) => {
-        const previewUrl = URL.createObjectURL(file)
-        objectUrlsRef.current.add(previewUrl)
-        return { id: crypto.randomUUID(), name: file.name, previewUrl }
-      })
-
-      const appendMessage = (message: Message) => {
-        setState((prev) => ({
-          ...prev,
-          chats: prev.chats.map((chat) =>
-            chat.id === chatId
-              ? { ...chat, updatedAt: Date.now(), messages: [...chat.messages, message] }
-              : chat,
-          ),
-        }))
+      let chatImages: ChatImage[] = []
+      if (images.length > 0) {
+        try {
+          chatImages = await Promise.all(
+            images.map(async (file) => ({
+              id: crypto.randomUUID(),
+              name: file.name,
+              dataUrl: await fileToDataUrl(file),
+            })),
+          )
+        } catch (caught) {
+          console.error('[App] Failed to read an attached image:', caught)
+          chatImages = []
+        }
       }
 
-      // Show the user's message (and attachments) immediately.
-      appendMessage({
+      const userMessage: Message = {
         id: crypto.randomUUID(),
         role: 'user',
         content: trimmed,
         images: chatImages.length > 0 ? chatImages : undefined,
-      })
+      }
 
-      try {
-        const canvas = images.length > 0 ? await preprocessToCanvas(images[0]) : undefined
-        const raw = await generateAnalysis(buildPrompt(trimmed), canvas)
+      // Show the user's message (and attachments) immediately.
+      appendToChat(chatId, userMessage)
 
-        if (!raw) {
-          appendMessage({
-            id: crypto.randomUUID(),
-            role: 'assistant',
-            content: 'I was unable to generate a response. Please try again.',
-          })
-          return
-        }
+      const history = [...chat.messages, userMessage]
+      const raw = await generate(buildMessages(history))
 
-        const structured: ClinicalFindings | undefined =
-          parseClinicalFindings(raw) ?? undefined
-
-        appendMessage({
-          id: crypto.randomUUID(),
-          role: 'assistant',
-          content: raw,
-          structured,
-        })
-      } catch (caught) {
-        appendMessage({
+      if (!raw) {
+        appendToChat(chatId, {
           id: crypto.randomUUID(),
           role: 'assistant',
           content:
-            caught instanceof Error
-              ? caught.message
-              : 'Something went wrong while contacting MedGemma.',
+            'I was unable to generate a response. Check the API endpoint settings and try again.',
         })
+        return
       }
-    },
-    [state.activeChatId, isReady, generateAnalysis],
-  )
 
-  const handleDownloadModel = useCallback(() => {
-    void initEngine()
-  }, [initEngine])
+      const structured: ClinicalFindings | undefined = parseClinicalFindings(raw) ?? undefined
+      appendToChat(chatId, {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content: raw,
+        structured,
+      })
+    },
+    [state, generate, appendToChat],
+  )
 
   const activeChat = state.chats.find((chat) => chat.id === state.activeChatId) ?? null
 
@@ -178,13 +156,14 @@ export default function App() {
       />
 
       <main className="flex flex-1 flex-col">
-        <ModelControls
-          isReady={isReady}
-          isInitializing={isInitializing}
-          error={error}
-          statusMessage={statusMessage}
-          onDownload={handleDownloadModel}
-        />
+        <ApiSettings config={apiConfig} onChange={handleConfigChange} />
+
+        {error && (
+          <div className="mx-auto flex w-full max-w-3xl items-center gap-2 px-4 pt-3 text-sm text-red-600">
+            <AlertCircle className="size-4 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
 
         {activeChat ? (
           <>
@@ -192,8 +171,12 @@ export default function App() {
             <ChatInput
               key={activeChat.id}
               onSend={sendMessage}
-              disabled={!isReady || isGenerating}
-              statusMessage={statusMessage}
+              disabled={!isConfigured || isGenerating}
+              statusMessage={
+                isGenerating
+                  ? 'Generating response...'
+                  : 'Configure the API endpoint above to start chatting.'
+              }
             />
           </>
         ) : (
@@ -204,7 +187,7 @@ export default function App() {
             </h2>
             <p className="max-w-md text-sm text-neutral-500">
               {state.chats.length === 0
-                ? 'Start a new chat to begin a clinical discussion with MedGemma.'
+                ? 'Start a new chat to begin a clinical discussion.'
                 : 'Choose a chat from the sidebar or start a new one.'}
             </p>
             <button

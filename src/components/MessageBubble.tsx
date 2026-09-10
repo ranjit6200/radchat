@@ -39,7 +39,7 @@ export default function MessageBubble({ message }: MessageBubbleProps) {
             {message.images.map((image) => (
               <img
                 key={image.id}
-                src={image.previewUrl}
+                src={image.dataUrl}
                 alt={image.name}
                 className="size-24 rounded-xl border border-neutral-200 object-cover shadow-sm"
               />

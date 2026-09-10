@@ -16,11 +16,11 @@ export interface ClinicalFindings {
   urgency?: Urgency
 }
 
-/** Lightweight reference to an image attached to a message (in-memory only). */
+/** Image attached to a message; `dataUrl` powers both display and API inputs. */
 export interface ChatImage {
   id: string
   name: string
-  previewUrl: string
+  dataUrl: string
 }
 
 export interface Message {
