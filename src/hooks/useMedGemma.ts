@@ -6,13 +6,15 @@ const IDLE_STATUS = 'Model not initialized.'
 export interface UseMedGemmaResult {
   /** True once the WASM runtime and model have finished loading. */
   isReady: boolean
+  /** True while the engine is downloading/loading the model. */
+  isInitializing: boolean
   /** True while a generation request is in flight. */
   isGenerating: boolean
   /** Last error message, or null when the engine is healthy. */
   error: string | null
   /** Human-readable progress/status line for the UI. */
   statusMessage: string
-  /** Loads the engine, reporting progress through `statusMessage`. Rejects on failure. */
+  /** Downloads/loads the engine, reporting progress through `statusMessage`. */
   initEngine: () => Promise<void>
   /** Runs multimodal analysis and returns the report, or null on failure. */
   generateAnalysis: (
@@ -34,6 +36,7 @@ function toErrorMessage(error: unknown): string {
  */
 export function useMedGemma(): UseMedGemmaResult {
   const [isReady, setIsReady] = useState(false)
+  const [isInitializing, setIsInitializing] = useState(false)
   const [isGenerating, setIsGenerating] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [statusMessage, setStatusMessage] = useState(IDLE_STATUS)
@@ -50,7 +53,8 @@ export function useMedGemma(): UseMedGemmaResult {
 
   const initEngine = useCallback(async (): Promise<void> => {
     setError(null)
-    setStatusMessage('Initializing model...')
+    setIsInitializing(true)
+    setStatusMessage('Preparing model...')
 
     try {
       await MedGemmaEngine.getInstance().init((step) => {
@@ -65,8 +69,8 @@ export function useMedGemma(): UseMedGemmaResult {
         setError(toErrorMessage(caught))
         setStatusMessage('Failed to initialize model.')
       }
-      // Re-throw so callers bail instead of tripping the generic "not initialized" guard.
-      throw caught
+    } finally {
+      if (isMountedRef.current) setIsInitializing(false)
     }
   }, [])
 
@@ -97,5 +101,13 @@ export function useMedGemma(): UseMedGemmaResult {
     [],
   )
 
-  return { isReady, isGenerating, error, statusMessage, initEngine, generateAnalysis }
+  return {
+    isReady,
+    isInitializing,
+    isGenerating,
+    error,
+    statusMessage,
+    initEngine,
+    generateAnalysis,
+  }
 }

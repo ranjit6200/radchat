@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AlertCircle } from 'lucide-react'
 import Sidebar from './components/Sidebar'
 import ChatWindow from './components/ChatWindow'
 import ChatInput from './components/ChatInput'
+import ModelControls from './components/ModelControls'
 import { useMedGemma } from './hooks/useMedGemma'
 import { preprocessToCanvas } from './utils/imageProcessor'
 import { buildPrompt } from './utils/promptBuilder'
@@ -29,8 +29,15 @@ function createChat(): ChatSession {
 
 export default function App() {
   const [state, setState] = useState<ChatState>({ chats: [], activeChatId: null })
-  const [isBusy, setIsBusy] = useState(false)
-  const { error, statusMessage, initEngine, generateAnalysis } = useMedGemma()
+  const {
+    isReady,
+    isInitializing,
+    isGenerating,
+    error,
+    statusMessage,
+    initEngine,
+    generateAnalysis,
+  } = useMedGemma()
   const objectUrlsRef = useRef<Set<string>>(new Set())
 
   // Release any object URLs created for message previews when the app unmounts.
@@ -90,6 +97,9 @@ export default function App() {
       const chatId = state.activeChatId
       if (!chatId) return
 
+      // The model must be downloaded/loaded via the controls before analysis runs.
+      if (!isReady) return
+
       const chatImages: ChatImage[] = images.map((file) => {
         const previewUrl = URL.createObjectURL(file)
         objectUrlsRef.current.add(previewUrl)
@@ -115,10 +125,7 @@ export default function App() {
         images: chatImages.length > 0 ? chatImages : undefined,
       })
 
-      setIsBusy(true)
       try {
-        await initEngine()
-
         const canvas = images.length > 0 ? await preprocessToCanvas(images[0]) : undefined
         const raw = await generateAnalysis(buildPrompt(trimmed), canvas)
 
@@ -149,12 +156,14 @@ export default function App() {
               ? caught.message
               : 'Something went wrong while contacting MedGemma.',
         })
-      } finally {
-        setIsBusy(false)
       }
     },
-    [state.activeChatId, initEngine, generateAnalysis],
+    [state.activeChatId, isReady, generateAnalysis],
   )
+
+  const handleDownloadModel = useCallback(() => {
+    void initEngine()
+  }, [initEngine])
 
   const activeChat = state.chats.find((chat) => chat.id === state.activeChatId) ?? null
 
@@ -169,19 +178,21 @@ export default function App() {
       />
 
       <main className="flex flex-1 flex-col">
+        <ModelControls
+          isReady={isReady}
+          isInitializing={isInitializing}
+          error={error}
+          statusMessage={statusMessage}
+          onDownload={handleDownloadModel}
+        />
+
         {activeChat ? (
           <>
             <ChatWindow messages={activeChat.messages} />
-            {error && (
-              <div className="mx-auto flex w-full max-w-3xl items-center gap-2 px-4 pt-3 text-sm text-red-600">
-                <AlertCircle className="size-4 shrink-0" />
-                <span>{error}</span>
-              </div>
-            )}
             <ChatInput
               key={activeChat.id}
               onSend={sendMessage}
-              disabled={isBusy}
+              disabled={!isReady || isGenerating}
               statusMessage={statusMessage}
             />
           </>
