@@ -38,21 +38,6 @@ function formatBytes(bytes: number): string {
 }
 
 /**
- * MedGemma 1.5 4B-IT (Q4) is a GPU-only build, so it cannot load without WebGPU.
- * Fail fast with an actionable message instead of an opaque task error.
- */
-function assertWebGpuAvailable(): void {
-  const gpu =
-    typeof navigator === 'undefined' ? undefined : (navigator as { gpu?: unknown }).gpu
-  if (!gpu) {
-    throw new Error(
-      'WebGPU is not available in this browser. MedGemma 1.5 4B-IT (Q4) requires a ' +
-        'WebGPU-capable browser such as a recent Chrome or Edge with hardware acceleration enabled.',
-    )
-  }
-}
-
-/**
  * Singleton wrapper around the MediaPipe GenAI `LlmInference` task for MedGemma 1.5.
  *
  * A single `LlmInference` instance owns the ~2.8 GB model in memory, so the engine is
@@ -102,9 +87,6 @@ export class MedGemmaEngine {
   }
 
   private async initialize(onProgress?: ProgressCallback): Promise<void> {
-    onProgress?.('Checking WebGPU support...')
-    assertWebGpuAvailable()
-
     onProgress?.('Downloading model runtime...')
     try {
       this.fileset = await FilesetResolver.forGenAiTasks(WASM_BASE_PATH)
@@ -114,10 +96,13 @@ export class MedGemmaEngine {
 
     const modelBlob = await this.resolveModelBlob(onProgress)
 
-    onProgress?.('Loading model into GPU memory (this can take a while)...')
+    onProgress?.('Loading model into memory (this can take a while)...')
     try {
       this.llmInference = await LlmInference.createFromOptions(this.fileset, {
         baseOptions: {
+          // The available MedGemma 1.5 4B-IT vision .litertlm is a CPU (int4) build with
+          // no GPU ("gpu_artisan") section, so inference must run on the CPU delegate.
+          delegate: 'CPU',
           modelAssetBuffer: modelBlob.stream().getReader(),
         },
         maxTokens: MAX_TOKENS,
