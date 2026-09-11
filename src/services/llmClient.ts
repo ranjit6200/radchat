@@ -2,14 +2,24 @@
  * Minimal OpenAI-compatible chat completions client with multimodal (vision) support.
  *
  * Works against any server that exposes the `/chat/completions` endpoint (OpenAI,
- * Ollama, LM Studio, vLLM, etc.). Configuration is persisted in localStorage so it
- * survives reloads, with optional Vite env defaults.
+ * DeepSeek, Ollama, LM Studio, vLLM, etc.). Provider-specific defaults and prompt
+ * quirks live in `./providers`; this module only handles configuration storage and
+ * the HTTP request/response cycle.
  */
+
+import {
+  DEFAULT_PROVIDER,
+  getProvider,
+  isProviderId,
+  type ProviderId,
+} from './providers'
 
 const CONFIG_STORAGE_KEY = 'openai_api_config'
 
 export interface ApiConfig {
-  /** Base URL, e.g. "https://api.openai.com/v1" or "http://localhost:11434/v1". */
+  /** Active provider profile. */
+  provider: ProviderId
+  /** Base URL, e.g. "https://api.openai.com/v1" or "https://api.deepseek.com". */
   baseUrl: string
   apiKey: string
   model: string
@@ -26,6 +36,10 @@ export interface ChatMessage {
 
 export interface ChatCompletionOptions {
   temperature?: number
+  /** Nucleus sampling probability. Omitted from the request when undefined. */
+  topP?: number
+  /** Top-k sampling cutoff. Omitted from the request when undefined. */
+  topK?: number
   maxTokens?: number
   /** Ask the server to force a JSON object response where supported. */
   jsonMode?: boolean
@@ -36,38 +50,138 @@ function readEnv(key: string): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-const ENV_DEFAULTS: ApiConfig = {
+/**
+ * Optional env fallbacks. Applied only to the default (MedGemma) provider so
+ * deployments configured purely through `VITE_OPENAI_*` variables keep working,
+ * without leaking those values into other providers.
+ */
+const ENV_DEFAULTS = {
   baseUrl: readEnv('VITE_OPENAI_BASE_URL'),
   apiKey: readEnv('VITE_OPENAI_API_KEY'),
   model: readEnv('VITE_OPENAI_MODEL'),
 }
 
-export function getApiConfig(): ApiConfig {
-  let stored: Partial<ApiConfig> = {}
-  if (typeof localStorage !== 'undefined') {
-    try {
-      const raw = localStorage.getItem(CONFIG_STORAGE_KEY)
-      if (raw) stored = JSON.parse(raw) as Partial<ApiConfig>
-    } catch {
-      stored = {}
-    }
-  }
+/** Values persisted for a single provider. */
+interface SavedConfig {
+  baseUrl: string
+  apiKey: string
+  model: string
+}
 
+interface StoredState {
+  activeProvider: ProviderId
+  configs: Partial<Record<ProviderId, SavedConfig>>
+}
+
+function toSavedConfig(value: unknown): SavedConfig | null {
+  if (typeof value !== 'object' || value === null) return null
+  const record = value as Record<string, unknown>
   return {
-    baseUrl: stored.baseUrl?.trim() || ENV_DEFAULTS.baseUrl,
-    apiKey: stored.apiKey?.trim() || ENV_DEFAULTS.apiKey,
-    model: stored.model?.trim() || ENV_DEFAULTS.model,
+    baseUrl: typeof record.baseUrl === 'string' ? record.baseUrl : '',
+    apiKey: typeof record.apiKey === 'string' ? record.apiKey : '',
+    model: typeof record.model === 'string' ? record.model : '',
   }
 }
 
-export function saveApiConfig(config: ApiConfig): void {
+/**
+ * Reads the persisted state, transparently migrating the legacy single-config
+ * shape (`{ baseUrl, apiKey, model }`) under the default provider.
+ */
+function readState(): StoredState {
+  const empty: StoredState = { activeProvider: DEFAULT_PROVIDER, configs: {} }
+  if (typeof localStorage === 'undefined') return empty
+
+  let raw: string | null = null
+  try {
+    raw = localStorage.getItem(CONFIG_STORAGE_KEY)
+  } catch {
+    return empty
+  }
+  if (!raw) return empty
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return empty
+  }
+  if (typeof parsed !== 'object' || parsed === null) return empty
+
+  const record = parsed as Record<string, unknown>
+
+  // Current shape: { activeProvider, configs: { [providerId]: SavedConfig } }.
+  if (typeof record.configs === 'object' && record.configs !== null) {
+    const configs: Partial<Record<ProviderId, SavedConfig>> = {}
+    for (const [key, value] of Object.entries(record.configs as Record<string, unknown>)) {
+      if (!isProviderId(key)) continue
+      const saved = toSavedConfig(value)
+      if (saved) configs[key] = saved
+    }
+    return {
+      activeProvider: isProviderId(record.activeProvider)
+        ? record.activeProvider
+        : DEFAULT_PROVIDER,
+      configs,
+    }
+  }
+
+  // Legacy shape: migrate it under the default provider.
+  const legacy = toSavedConfig(record)
+  if (!legacy) return empty
+  return { activeProvider: DEFAULT_PROVIDER, configs: { [DEFAULT_PROVIDER]: legacy } }
+}
+
+function writeState(state: StoredState): void {
   if (typeof localStorage === 'undefined') return
-  const normalized: ApiConfig = {
+  try {
+    localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(state))
+  } catch {
+    // Ignore storage failures (e.g. private mode); the in-memory config still works.
+  }
+}
+
+/** Merges saved values with the profile defaults and legacy env fallbacks. */
+function resolveConfig(provider: ProviderId, saved: SavedConfig | undefined): ApiConfig {
+  const profile = getProvider(provider)
+  const useEnv = provider === DEFAULT_PROVIDER
+  return {
+    provider,
+    baseUrl: saved?.baseUrl.trim() || profile.defaultBaseUrl || (useEnv ? ENV_DEFAULTS.baseUrl : ''),
+    apiKey: saved?.apiKey.trim() || (useEnv ? ENV_DEFAULTS.apiKey : ''),
+    model: saved?.model.trim() || profile.defaultModel || (useEnv ? ENV_DEFAULTS.model : ''),
+  }
+}
+
+/** Loads the active provider configuration (with defaults applied). */
+export function getApiConfig(): ApiConfig {
+  const state = readState()
+  return resolveConfig(state.activeProvider, state.configs[state.activeProvider])
+}
+
+/** Persists a configuration under its provider and makes that provider active. */
+export function saveApiConfig(config: ApiConfig): void {
+  const provider = isProviderId(config.provider) ? config.provider : DEFAULT_PROVIDER
+  const state = readState()
+  state.activeProvider = provider
+  state.configs[provider] = {
     baseUrl: config.baseUrl.trim(),
     apiKey: config.apiKey.trim(),
     model: config.model.trim(),
   }
-  localStorage.setItem(CONFIG_STORAGE_KEY, JSON.stringify(normalized))
+  writeState(state)
+}
+
+/**
+ * Switches the active provider and returns its saved configuration. Values saved
+ * for every provider (including the one being left) are preserved, so switching
+ * back restores them.
+ */
+export function selectProvider(provider: ProviderId): ApiConfig {
+  const next = isProviderId(provider) ? provider : DEFAULT_PROVIDER
+  const state = readState()
+  state.activeProvider = next
+  writeState(state)
+  return resolveConfig(next, state.configs[next])
 }
 
 export function isApiConfigured(config: ApiConfig): boolean {
@@ -81,7 +195,7 @@ function completionsUrl(baseUrl: string): string {
 }
 
 interface ChatCompletionResponse {
-  choices?: Array<{ message?: { content?: unknown } }>
+  choices?: Array<{ message?: { content?: unknown; reasoning_content?: unknown } }>
 }
 
 function extractContent(content: unknown): string | null {
@@ -137,6 +251,8 @@ export async function chatCompletion(
     temperature: options.temperature ?? 0.2,
     max_tokens: options.maxTokens ?? 1024,
   }
+  if (options.topP !== undefined) body.top_p = options.topP
+  if (options.topK !== undefined) body.top_k = options.topK
   if (options.jsonMode) {
     body.response_format = { type: 'json_object' }
   }
@@ -159,7 +275,10 @@ export async function chatCompletion(
   }
 
   const data = (await response.json()) as ChatCompletionResponse
-  const content = extractContent(data.choices?.[0]?.message?.content)
+  const message = data.choices?.[0]?.message
+  // llama.cpp can route the generated text into `reasoning_content` when a reasoning
+  // format is configured; fall back to it so the response is never lost.
+  const content = extractContent(message?.content) ?? extractContent(message?.reasoning_content)
   if (content === null) {
     throw new Error('The API response did not contain any message content.')
   }

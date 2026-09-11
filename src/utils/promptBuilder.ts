@@ -1,53 +1,44 @@
 import type { ChatContentPart, ChatMessage } from '../services/llmClient'
+import { getProvider, type ProviderId, type ProviderProfile } from '../services/providers'
 import type { Message } from '../types'
 
 /**
- * System directive sent as the first chat message. It pins the model to a
- * radiology-assistant persona and forces a single JSON object matching the
- * `ClinicalFindings` schema so the UI can render structured cards.
+ * Builds the multimodal user content for a message. Image/text ordering and the
+ * fallback prompt come from the active provider profile so Gemma 3 (images
+ * first) and DeepSeek (text first) can share one pipeline.
  */
-export const SYSTEM_PROMPT = [
-  'You are MedGemma, an expert clinical radiology assistant.',
-  'Analyze the provided medical image (when present) together with the clinician instruction.',
-  'Base your assessment only on visible evidence and state uncertainty explicitly.',
-  'Do not invent patient identifiers or values that are not visible in the image.',
-  '',
-  'Respond with a SINGLE JSON object and no additional prose or markdown fences.',
-  'The object MUST use this exact shape:',
-  '{',
-  '  "study": string,                     // imaging study / modality, if identifiable',
-  '  "findings": string[],                // observed findings, one per array item',
-  '  "impression": string,                // concise summary interpretation',
-  '  "differentialDiagnoses": string[],   // ranked differentials',
-  '  "recommendations": string[],         // suggested next steps / follow-up',
-  '  "urgency": "routine" | "urgent" | "emergent"',
-  '}',
-  'Omit optional fields only when they genuinely do not apply.',
-].join('\n')
-
-function buildUserContent(text: string, imageDataUrls: string[]): string | ChatContentPart[] {
+function buildUserContent(
+  text: string,
+  imageDataUrls: string[],
+  profile: ProviderProfile,
+): string | ChatContentPart[] {
   const trimmed = text.trim()
   if (imageDataUrls.length === 0) return trimmed
 
-  const parts: ChatContentPart[] = []
-  if (trimmed) parts.push({ type: 'text', text: trimmed })
-  for (const url of imageDataUrls) {
-    parts.push({ type: 'image_url', image_url: { url } })
-  }
-  return parts
+  const textPart: ChatContentPart = { type: 'text', text: trimmed || profile.fallbackUserPrompt }
+  const imageParts: ChatContentPart[] = imageDataUrls.map((url) => ({
+    type: 'image_url',
+    image_url: { url },
+  }))
+
+  return profile.imagesFirst ? [...imageParts, textPart] : [textPart, ...imageParts]
 }
 
 /**
- * Converts the in-memory transcript (plus the system prompt) into the message
- * array expected by an OpenAI-compatible chat completions request.
+ * Converts the in-memory transcript (plus the provider system prompt) into the
+ * message array expected by an OpenAI-compatible chat completions request.
  */
-export function buildMessages(messages: Message[]): ChatMessage[] {
-  const result: ChatMessage[] = [{ role: 'system', content: SYSTEM_PROMPT }]
+export function buildMessages(messages: Message[], providerId?: ProviderId): ChatMessage[] {
+  const profile = getProvider(providerId)
+  const result: ChatMessage[] = [{ role: 'system', content: profile.systemPrompt }]
 
   for (const message of messages) {
     if (message.role === 'user') {
       const imageDataUrls = (message.images ?? []).map((image) => image.dataUrl)
-      result.push({ role: 'user', content: buildUserContent(message.content, imageDataUrls) })
+      result.push({
+        role: 'user',
+        content: buildUserContent(message.content, imageDataUrls, profile),
+      })
     } else if (message.role === 'assistant') {
       result.push({ role: 'assistant', content: message.content })
     }

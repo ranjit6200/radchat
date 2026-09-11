@@ -97,6 +97,11 @@ export function parseClinicalFindings(raw: string): ClinicalFindings | null {
     impression: impression ?? '',
   }
 
+  // Parses the new backend buffer parameter used to give the multi-modal
+  // engine cross-attention processing space before printing clinical prose.
+  const visualAnalysis = toOptionalString(record.visual_analysis)
+  if (visualAnalysis) result.visualAnalysis = visualAnalysis
+
   const study = toOptionalString(record.study)
   if (study) result.study = study
 

@@ -9,8 +9,10 @@ import {
   getApiConfig,
   isApiConfigured,
   saveApiConfig,
+  selectProvider,
   type ApiConfig,
 } from './services/llmClient'
+import type { ProviderId } from './services/providers'
 import { fileToDataUrl } from './utils/fileToDataUrl'
 import { buildMessages } from './utils/promptBuilder'
 import { parseClinicalFindings } from './utils/clinicalParser'
@@ -44,6 +46,10 @@ export default function App() {
   const handleConfigChange = useCallback((next: ApiConfig) => {
     saveApiConfig(next)
     setApiConfig(next)
+  }, [])
+
+  const handleProviderChange = useCallback((provider: ProviderId) => {
+    setApiConfig(selectProvider(provider))
   }, [])
 
   const createNewChat = useCallback(() => {
@@ -85,7 +91,7 @@ export default function App() {
   const sendMessage = useCallback(
     async (text: string, images: File[]) => {
       const trimmed = text.trim()
-      if (!trimmed) return
+      if (!trimmed && images.length === 0) return
 
       const chatId = state.activeChatId
       if (!chatId) return
@@ -120,7 +126,7 @@ export default function App() {
       appendToChat(chatId, userMessage)
 
       const history = [...chat.messages, userMessage]
-      const raw = await generate(buildMessages(history))
+      const raw = await generate(buildMessages(history, apiConfig.provider))
 
       if (!raw) {
         appendToChat(chatId, {
@@ -140,7 +146,7 @@ export default function App() {
         structured,
       })
     },
-    [state, generate, appendToChat],
+    [state, apiConfig, generate, appendToChat],
   )
 
   const activeChat = state.chats.find((chat) => chat.id === state.activeChatId) ?? null
@@ -156,7 +162,11 @@ export default function App() {
       />
 
       <main className="flex flex-1 flex-col">
-        <ApiSettings config={apiConfig} onChange={handleConfigChange} />
+        <ApiSettings
+          config={apiConfig}
+          onChange={handleConfigChange}
+          onProviderChange={handleProviderChange}
+        />
 
         {error && (
           <div className="mx-auto flex w-full max-w-3xl items-center gap-2 px-4 pt-3 text-sm text-red-600">

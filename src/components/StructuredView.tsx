@@ -1,8 +1,10 @@
 import type { ReactNode } from 'react'
 import {
   AlertTriangle,
+  ChevronDown,
   ClipboardCheck,
   ClipboardList,
+  Eye,
   FileText,
   Lightbulb,
   ListChecks,
@@ -63,6 +65,22 @@ export default function StructuredView({ data }: StructuredViewProps) {
           </span>
         )}
       </div>
+
+      {/* Model visual reasoning (collapsible) */}
+      {data.visualAnalysis && (
+        <details className="group rounded-lg border border-neutral-200 bg-neutral-50/70">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-2 rounded-lg px-3 py-2 outline-none focus-visible:ring-2 focus-visible:ring-emerald-200 [&::-webkit-details-marker]:hidden">
+            <span className="flex items-center gap-1.5 text-xs font-semibold tracking-wide text-neutral-500 uppercase">
+              <Eye className="size-3.5" />
+              Model Visual Reasoning Path
+            </span>
+            <ChevronDown className="size-4 shrink-0 text-neutral-400 transition-transform group-open:rotate-180" />
+          </summary>
+          <div className="border-t border-neutral-200 px-3 py-2.5 text-xs leading-relaxed text-neutral-600">
+            <Markdown>{data.visualAnalysis}</Markdown>
+          </div>
+        </details>
+      )}
 
       {/* Findings */}
       {findings.length > 0 && (

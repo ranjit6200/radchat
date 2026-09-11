@@ -92,41 +92,84 @@ API_SECRET_NAME = os.environ.get("API_SECRET_NAME", "vllm-api-key-secret")
 API_KEY_ENV = os.environ.get("API_KEY_ENV", "API_KEY")
 
 MODELS_DIR = "/models"
-LLAMA_SERVER_BIN = "/opt/llama.cpp/build/bin/llama-server"
+# llama-server shipped by the prebuilt ghcr.io/ggml-org/llama.cpp:server-cuda image.
+LLAMA_SERVER_BIN = "/app/llama-server"
+# /app also holds the dynamic CUDA backend (libggml-cuda.so), because that image is
+# built with GGML_BACKEND_DL=ON, so llama-server must search there for it.
+LLAMA_SERVER_DIR = os.path.dirname(LLAMA_SERVER_BIN)
 LLAMA_PORT = 8080
 
 GPU = "T4"                 # T4 has 16 GB VRAM; Q8_0 + mmproj + KV cache fit easily.
 CONTEXT_SIZE = 8192        # plenty for an image + report; keeps the KV cache small.
 REQUEST_TIMEOUT = 600      # seconds; ~1024 tokens on a T4 is roughly 30-60 s.
 
+# SigLIP vision input size for MedGemma 1.5 4B; images are stretched to this square (default_to_square).
+MEDGEMMA_IMAGE_SIZE = 896
+
+# JSON Schema the model must emit. Mirrors ClinicalFindings in src/types.ts, and is
+# enforced through llama.cpp's grammar-constrained "json_schema" response format so the
+# model cannot fall back to free-form reasoning/prose. "findings" is listed first so
+# generation starts on the report body - the JSON analogue of ending a prose prompt with
+# "FINDINGS:".
 # --------------------------------------------------------------------------- #
-# Container image: CUDA toolkit + a CUDA build of llama.cpp
+# Replacement Schema: Forces internal reasoning space before structure.
 # --------------------------------------------------------------------------- #
 
+CLINICAL_FINDINGS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        # This property MUST remain first. It gives MedGemma a text padding buffer 
+        # to execute image cross-attention loops before forcing structured clinical prose.
+        "visual_analysis": {
+            "type": "string", 
+            "description": "Internal raw visual reasoning and feature tracking path."
+        },
+        "findings": {
+            "type": "array", 
+            "items": {"type": "string"}
+        },
+        "impression": {"type": "string"},
+        "study": {"type": "string"},
+        "differentialDiagnoses": {
+            "type": "array", 
+            "items": {"type": "string"}
+        },
+        "recommendations": {
+            "type": "array", 
+            "items": {"type": "string"}
+        },
+        "urgency": {
+            "type": "string", 
+            "enum": ["routine", "urgent", "emergent"]
+        },
+    },
+    # By making visual_analysis required and placing it first, the grammar engine 
+    # lets the model 'think' visually before generating report metrics.
+    "required": ["visual_analysis", "findings", "impression"],
+    "additionalProperties": False,
+}
+
+
+# --------------------------------------------------------------------------- #
+# Container image: prebuilt, CUDA-enabled llama.cpp (no source compilation)
+# --------------------------------------------------------------------------- #
+# The official image ships /app/llama-server built with GGML_CUDA=ON for all
+# supported GPU architectures (including sm_75 / Tesla T4) on CUDA 12.8, so the
+# Modal image build is just a cached pip install instead of a full C++ compile.
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.4.1-devel-ubuntu22.04",
+        "ghcr.io/ggml-org/llama.cpp:server-cuda",
         add_python="3.11",
     )
-    .apt_install("git", "build-essential", "cmake", "ca-certificates", "libgomp1")
-    .run_commands(
-        # depth=1 keeps the build fast; llama.cpp master supports MedGemma.
-        "git clone --depth 1 https://github.com/ggml-org/llama.cpp /opt/llama.cpp",
-        # CMAKE_CUDA_ARCHITECTURES=75 is the Tesla T4 (sm_75).
-        "cmake -S /opt/llama.cpp -B /opt/llama.cpp/build "
-        "-DCMAKE_BUILD_TYPE=Release "
-        "-DGGML_CUDA=ON "
-        "-DCMAKE_CUDA_ARCHITECTURES=75 "
-        "-DLLAMA_CURL=OFF "
-        "-DLLAMA_BUILD_TESTS=OFF "
-        "-DLLAMA_BUILD_EXAMPLES=OFF "
-        "-DLLAMA_BUILD_TOOLS=ON",
-        "cmake --build /opt/llama.cpp/build --config Release -j$(nproc) --target llama-server",
-    )
+    # The base image sets ENTRYPOINT ["/app/llama-server"]. Reset it, otherwise
+    # Modal's Python runner is passed as arguments to llama-server and startup
+    # fails with "error: invalid argument: python" (exit code 1).
+    .entrypoint([])
     .pip_install(
         "fastapi[standard]",
         "httpx",
         "huggingface_hub[hf_transfer]",
+        "pillow",
     )
     .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
 )
@@ -212,9 +255,58 @@ def main() -> None:
 # Inference server (llama.cpp) + OpenAI-compatible FastAPI proxy
 # --------------------------------------------------------------------------- #
 
+def _preprocess_image_data_url(data_url: str) -> str:
+    """Normalise an ``image_url`` to the input MedGemma 1.5 4B expects.
+
+    MedGemma is Gemma 3 based, and Gemma 3's image processor resizes by *stretching*
+    to the exact square input (``default_to_square``, no padding), so we do the same:
+    force 3-channel RGB (dropping alpha / replicating grayscale) and resize to
+    MEDGEMMA_IMAGE_SIZE x MEDGEMMA_IMAGE_SIZE with Lanczos interpolation. The
+    remaining stages (rescale + mean/std normalisation) are applied inside llama.cpp's
+    mmproj/SigLIP tower, which consumes an encoded image rather than a raw tensor.
+
+    We deliberately do NOT letterbox (pad with black bars): that mismatches Gemma 3's
+    preprocessing and shrinks the anatomy within the frame, which can hide findings.
+    """
+    if not isinstance(data_url, str) or not data_url.startswith("data:"):
+        return data_url
+
+    header, _, encoded = data_url.partition(",")
+    if ";base64" not in header or not encoded:
+        return data_url
+
+    import base64
+    import io
+
+    from PIL import Image
+
+    try:
+        raw = base64.b64decode(encoded)
+    except Exception:  # noqa: BLE001 - not our base64; leave it for llama-server
+        return data_url
+
+    try:
+        with Image.open(io.BytesIO(raw)) as opened:
+            image = opened.convert("RGB")  # drop alpha / replicate grayscale to RGB
+    except Exception:  # noqa: BLE001 - unreadable image; let llama-server report it
+        return data_url
+
+    # Stretch to the model's fixed square input (matches Gemma 3's default_to_square).
+    image = image.resize(
+        (MEDGEMMA_IMAGE_SIZE, MEDGEMMA_IMAGE_SIZE),
+        Image.Resampling.LANCZOS,
+    )
+
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+
 def _build_proxy_app():
     """A thin, CORS-enabled reverse proxy in front of the local llama-server."""
     import hmac
+
+    import json
 
     import httpx
     from fastapi import Depends, FastAPI, HTTPException, Request
@@ -237,6 +329,50 @@ def _build_proxy_app():
     expected_api_key = os.environ.get(API_KEY_ENV, "")
     _bearer = HTTPBearer(auto_error=False)
 
+    def _prepare_chat_request(body: bytes) -> bytes:
+        """Rewrite a chat request before it reaches llama-server.
+
+        1. Upgrade ``response_format`` from json_object to a grammar-constrained
+           json_schema so the model must emit ClinicalFindings JSON (a bare
+           json_object request is not enforced, so the model returns free prose).
+        2. Normalise every attached image to MedGemma's 896x896 RGB SigLIP input.
+
+        The system/user prompt is owned by the client (src/utils/promptBuilder.ts) and is
+        forwarded untouched.
+        """
+        try:
+            payload = json.loads(body)
+        except Exception:  # noqa: BLE001 - forward anything unparseable untouched
+            return body
+        if not isinstance(payload, dict):
+            return body
+
+        response_format = payload.get("response_format")
+        if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "clinical_findings",
+                    "schema": CLINICAL_FINDINGS_SCHEMA,
+                    "strict": True,
+                },
+            }
+
+        for message in payload.get("messages") or []:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "image_url":
+                    continue
+                image_url = part.get("image_url")
+                if isinstance(image_url, dict) and isinstance(image_url.get("url"), str):
+                    image_url["url"] = _preprocess_image_data_url(image_url["url"])
+
+        return json.dumps(payload).encode("utf-8")
+
     async def require_api_key(
         credentials: HTTPAuthorizationCredentials = Depends(_bearer),
     ) -> None:
@@ -258,6 +394,8 @@ def _build_proxy_app():
         if content_type:
             headers["content-type"] = content_type
         body = await request.body()
+        if upstream_path == "/v1/chat/completions":
+            body = _prepare_chat_request(body)
         try:
             resp = await client.post(f"{upstream}{upstream_path}", content=body, headers=headers)
         except httpx.HTTPError as exc:
@@ -346,11 +484,16 @@ class MedGemma:
             "--ctx-size", str(CONTEXT_SIZE),
             "--host", "127.0.0.1",
             "--port", str(LLAMA_PORT),
+            "--reasoning-format", "deepseek",
             "--jinja",                 # use the GGUF chat template (<start_of_image> etc.)
-            "--no-mmap",               # read weights from the Volume eagerly
         ]
+        # No --no-mmap: llama.cpp memory-maps the GGUF by default, so startup does
+        # not eagerly copy the whole model out of the network Volume.
+        # The prebuilt image uses GGML_BACKEND_DL=ON, so the CUDA backend is a shared
+        # library in /app; run from there and point llama-server at it explicitly.
+        env = {**os.environ, "GGML_BACKEND_DIR": LLAMA_SERVER_DIR}
         print("[llama-server] launching: " + " ".join(cmd), flush=True)
-        return subprocess.Popen(cmd)
+        return subprocess.Popen(cmd, cwd=LLAMA_SERVER_DIR, env=env)
 
     def _wait_until_ready(self, timeout: float = 60 * 30) -> None:
         import urllib.error

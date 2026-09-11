@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { chatCompletion, getApiConfig, type ChatMessage } from '../services/llmClient'
+import { getProvider } from '../services/providers'
 
 export interface UseChatModelResult {
   /** True while a generation request is in flight. */
@@ -12,7 +13,8 @@ export interface UseChatModelResult {
 
 /**
  * React wrapper around the OpenAI-compatible client. Reads the latest saved API
- * config on every call and keeps request/error state in sync.
+ * config on every call, applies the active provider request options, and keeps
+ * request/error state in sync.
  */
 export function useChatModel(): UseChatModelResult {
   const [isGenerating, setIsGenerating] = useState(false)
@@ -36,7 +38,15 @@ export function useChatModel(): UseChatModelResult {
     setIsGenerating(true)
 
     try {
-      return await chatCompletion(getApiConfig(), messages, { jsonMode: true })
+      const config = getApiConfig()
+      const profile = getProvider(config.provider)
+      return await chatCompletion(config, messages, {
+        jsonMode: profile.jsonMode,
+        temperature: profile.temperature,
+        topP: profile.topP,
+        topK: profile.topK,
+        maxTokens: profile.maxTokens,
+      })
     } catch (caught) {
       if (isMountedRef.current) {
         setError(caught instanceof Error ? caught.message : 'An unknown error occurred.')

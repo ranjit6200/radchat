@@ -8,6 +8,12 @@ export type Urgency = 'routine' | 'urgent' | 'emergent'
  * parsed findings that StructuredView renders as cards.
  */
 export interface ClinicalFindings {
+  /**
+   * Raw model visual reasoning / feature-tracking path captured before report
+   * statements (the backend's `visual_analysis` field). Rendered in a collapsible
+   * "Model Visual Reasoning Path" section.
+   */
+  visualAnalysis?: string
   study?: string
   findings: string[]
   impression: string

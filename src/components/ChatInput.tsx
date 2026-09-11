@@ -77,7 +77,7 @@ export default function ChatInput({ onSend, disabled = false, statusMessage }: C
 
   const handleSend = () => {
     const trimmed = text.trim()
-    if (!trimmed || disabled) return
+    if ((!trimmed && images.length === 0) || disabled) return
     onSend(trimmed, images.map((img) => img.file))
     setText('')
     clearImages()
@@ -139,7 +139,7 @@ export default function ChatInput({ onSend, disabled = false, statusMessage }: C
     addImages(Array.from(event.dataTransfer.files))
   }
 
-  const canSend = text.trim().length > 0 && !disabled
+  const canSend = (text.trim().length > 0 || images.length > 0) && !disabled
 
   return (
     <div className="border-t border-neutral-200 bg-white p-3">
